@@ -1,55 +1,91 @@
-export PATH := $(GOPATH)/bin:$(PATH)
-export GO15VENDOREXPERIMENT := 1
+export PATH := $(PATH):`go env GOPATH`/bin
+export GO111MODULE=on
+LDFLAGS := -s -w
+NOWEB_TAG = $(shell [ ! -d web/frps/dist ] || [ ! -d web/frpc/dist ] && echo ',noweb')
+FRP_COMPAT_BASELINE_COUNT ?= 8
+FRP_COMPAT_FLOOR_VERSION ?= 0.61.0
 
-all: fmt build
+.PHONY: web web-ci frps-web frpc-web frps frpc e2e-compatibility-smoke e2e-compatibility e2e-compatibility-floor
 
-build: frps frpc build_test
+all: env fmt web build
 
-build_test: echo_server http_server
+build: frps frpc
 
-# compile assets into binary file
-assets:
-	go get -d github.com/rakyll/statik
-	@go install github.com/rakyll/statik
-	@rm -rf ./src/assets/statik
-	go generate ./src/...
+env:
+	@go version
+
+web: frps-web frpc-web
+
+web-ci:
+	cd web && npm ci && npm run lint:check --workspace frps && npm run lint:check --workspace frpc && npm run test:unit && npm run build --workspace frps && npm run build --workspace frpc
+
+frps-web:
+	$(MAKE) -C web/frps build
+
+frpc-web:
+	$(MAKE) -C web/frpc build
 
 fmt:
-	go fmt ./src/...
-	@go fmt ./test/echo_server.go
-	@go fmt ./test/http_server.go
-	@go fmt ./test/func_test.go
+	go fmt ./...
+
+fmt-more:
+	gofumpt -l -w .
+
+gci:
+	gci write -s standard -s default -s "prefix(github.com/fatedier/frp/)" ./
+
+vet:
+	go vet -tags "$(NOWEB_TAG)" ./...
 
 frps:
-	go build -o bin/frps ./src/cmd/frps
-	@cp -rf ./src/assets/static ./bin
+	env CGO_ENABLED=0 go build -trimpath -ldflags "$(LDFLAGS)" -tags "frps$(NOWEB_TAG)" -o bin/frps ./cmd/frps
 
 frpc:
-	go build -o bin/frpc ./src/cmd/frpc
-
-echo_server:
-	go build -o test/bin/echo_server ./test/echo_server.go
-
-http_server:
-	go build -o test/bin/http_server ./test/http_server.go
+	env CGO_ENABLED=0 go build -trimpath -ldflags "$(LDFLAGS)" -tags "frpc$(NOWEB_TAG)" -o bin/frpc ./cmd/frpc
 
 test: gotest
 
 gotest:
-	go test -v ./src/...
+	go test -tags "$(NOWEB_TAG)" -v --cover ./assets/...
+	go test -tags "$(NOWEB_TAG)" -v --cover ./cmd/...
+	go test -tags "$(NOWEB_TAG)" -v --cover ./client/...
+	go test -tags "$(NOWEB_TAG)" -v --cover ./server/...
+	go test -tags "$(NOWEB_TAG)" -v --cover ./pkg/...
 
-alltest:
-	cd ./test && ./run_test.sh && cd -
-	go test -v ./src/...
-	go test -v ./test/func_test.go
-	cd ./test && ./clean_test.sh && cd -
+e2e:
+	./hack/run-e2e.sh
 
+e2e-trace:
+	DEBUG=true LOG_LEVEL=trace ./hack/run-e2e.sh
+
+e2e-compatibility-smoke: build
+	FRP_COMPAT_BASELINE_COUNT=1 ./hack/run-e2e-compatibility.sh
+
+e2e-compatibility: build
+	FRP_COMPAT_BASELINE_COUNT="$(FRP_COMPAT_BASELINE_COUNT)" ./hack/run-e2e-compatibility.sh
+
+e2e-compatibility-floor: build
+	FRP_COMPAT_BASELINE_VERSIONS="$(FRP_COMPAT_FLOOR_VERSION)" ./hack/run-e2e-compatibility.sh
+
+e2e-compatibility-last-frpc:
+	if [ ! -d "./lastversion" ]; then \
+		TARGET_DIRNAME=lastversion ./hack/download.sh; \
+	fi
+	FRPC_PATH="`pwd`/lastversion/frpc" ./hack/run-e2e.sh
+	rm -r ./lastversion
+
+e2e-compatibility-last-frps:
+	if [ ! -d "./lastversion" ]; then \
+		TARGET_DIRNAME=lastversion ./hack/download.sh; \
+	fi
+	FRPS_PATH="`pwd`/lastversion/frps" ./hack/run-e2e.sh
+	rm -r ./lastversion
+
+alltest: vet gotest e2e
+	
 clean:
 	rm -f ./bin/frpc
 	rm -f ./bin/frps
-	rm -f ./test/bin/echo_server
-	rm -f ./test/bin/http_server
-	cd ./test && ./clean_test.sh && cd -
-
-save:
-	godep save ./src/...
+	rm -rf ./lastversion
+	rm -rf ./.cache
+	rm -rf ./.compat
